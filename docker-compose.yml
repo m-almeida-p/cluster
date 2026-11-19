@@ -1,0 +1,315 @@
+# Shared local infrastructure for the Yape AI repos.
+#
+# One project owns the infra so that ms-ml-ai-gateway-bs, ms-ml-genai-agents-bs
+# and ms-ml-agents-bff stop each building their own copy. Their per-repo
+# services live in <repo>/local-1/docker-compose.yml and join the network
+# published below.
+#
+# Service names are part of the contract: the repo bootstrap scripts resolve
+# "redis", "rest-proxy" and "schema-registry" by hostname, so renaming a service
+# here breaks them.
+name: yape-cluster
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: yape-redis
+    restart: unless-stopped
+    # The password is hardcoded in the repo bootstrap scripts and is the default
+    # in the gateway config (REDIS_PWD:-debug), so it cannot vary per machine.
+    command: ["redis-server", "--requirepass", "debug", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "debug", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [yape-local]
+
+  db:
+    image: postgres:18
+    container_name: yape-postgres
+    restart: unless-stopped
+    # Logical decoding lets Debezium read event_store.conversation_events from the WAL. The default,
+    # replica, cannot; the slot and wal sender limits are already 10.
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: postgres
+      # Local only: Unleash connects without credentials.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Postgres 18 images keep the data in a version folder under /var/lib/postgresql,
+      # so the volume is mounted there, and it is a new volume: a Postgres 15 data
+      # directory cannot be opened by 18.
+      - postgres18_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=postgres", "--host=127.0.0.1", "--port=5432"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks: [yape-local]
+
+  unleash:
+    # Console login: admin / unleash4all
+    image: unleashorg/unleash-server:latest
+    container_name: yape-unleash
+    restart: unless-stopped
+    env_file:
+      - ./unleash/.env.config
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${UNLEASH_PORT:-4242}:4242"
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:4242/health || exit 1
+      interval: 5s
+      timeout: 30s
+      retries: 20
+      start_period: 15s
+    networks: [yape-local]
+
+  redisinsight:
+    image: redislabs/redisinsight:1.13.0
+    container_name: yape-redisinsight
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${REDISINSIGHT_PORT:-8001}:8001"
+    volumes:
+      - redisinsight_data:/db
+    networks: [yape-local]
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.3
+    container_name: yape-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "${ZOOKEEPER_PORT:-2181}:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    networks: [yape-local]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: yape-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      # Two listeners on purpose: containers reach the broker as kafka:29092,
+      # processes on the host (the gateway binary) as localhost:9092. A client
+      # gets back the advertised address for the listener it connected through,
+      # so both must be correct or the second hop fails after metadata lookup.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:29092", "--list"]
+      interval: 10s
+      timeout: 20s
+      retries: 20
+    volumes:
+      # Without this the broker log dir is lost on `docker compose down`, which
+      # silently wipes the _schemas topic and every registered subject with it.
+      - kafka_data:/var/lib/kafka/data
+    networks: [yape-local]
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.3
+    container_name: yape-schema-registry
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${SCHEMA_REGISTRY_PORT:-8085}:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      SCHEMA_REGISTRY_ACCESS_CONTROL_ALLOW_ORIGIN: '*'
+      SCHEMA_REGISTRY_ACCESS_CONTROL_ALLOW_METHODS: 'GET,POST,PUT,OPTIONS'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    networks: [yape-local]
+
+  rest-proxy:
+    image: confluentinc/cp-kafka-rest:7.5.3
+    container_name: yape-rest-proxy
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    ports:
+      - "${REST_PROXY_PORT:-8082}:8082"
+    environment:
+      KAFKA_REST_HOST_NAME: rest-proxy
+      KAFKA_REST_BOOTSTRAP_SERVERS: 'kafka:29092'
+      KAFKA_REST_LISTENERS: "http://0.0.0.0:8082"
+      KAFKA_REST_SCHEMA_REGISTRY_URL: 'http://schema-registry:8081'
+    networks: [yape-local]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: yape-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+      - schema-registry
+    ports:
+      - "${KAFKA_UI_PORT:-8090}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: 'yape-local'
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'kafka:29092'
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: 'http://schema-registry:8081'
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    networks: [yape-local]
+
+  init-kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: yape-init-kafka
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CREATE_TOPICS: ${KAFKA_CREATE_TOPICS}
+    # Topics are declared as name:partitions:replicas in .env, the same format
+    # wurstmeister/kafka accepts via KAFKA_CREATE_TOPICS. That image applies the
+    # variable itself, but its last release is Kafka 2.8.1 from 2022, so the
+    # broker stays on cp-kafka and this sidecar applies the list instead.
+    # Runs once and exits; --if-not-exists keeps restarts harmless.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "$$KAFKA_CREATE_TOPICS" | tr ',' '\n' | while read -r spec; do
+          spec=$$(echo "$$spec" | tr -d '[:space:]')
+          [ -z "$$spec" ] && continue
+          topic=$$(echo "$$spec" | cut -d: -f1)
+          partitions=$$(echo "$$spec" | cut -d: -f2)
+          replicas=$$(echo "$$spec" | cut -d: -f3)
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+            --topic "$$topic" \
+            --partitions "$${partitions:-1}" \
+            --replication-factor "$${replicas:-1}"
+        done
+        echo 'Topics now present:'
+        kafka-topics --bootstrap-server kafka:29092 --list
+    networks: [yape-local]
+
+  connect:
+    # Kafka Connect worker, shared like Kafka and Schema Registry. It holds no
+    # connector: each publisher registers its own through the REST API (the
+    # conversation events connector lives in ms-ml-conv-history-publisher). A connector
+    # creates its own topic (topic.creation.default.*), so Debezium topics are not in
+    # KAFKA_CREATE_TOPICS.
+    image: confluentinc/cp-kafka-connect:7.5.3
+    container_name: yape-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    ports:
+      - "${CONNECT_PORT:-8083}:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: yape-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Worker defaults only; a connector sets its own converters.
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      # Lets a connector create its topic with the partitions it asks for (the publisher relies on it).
+      CONNECT_TOPIC_CREATION_ENABLE: "true"
+    # The Debezium plugin comes from Confluent Hub, so the worker needs internet
+    # on its first start; the image ships no Debezium. Pin the version to match
+    # the connector tested against.
+    command:
+      - bash
+      - -c
+      - |
+        confluent-hub install --no-prompt debezium/debezium-connector-postgresql:2.5.4
+        exec /etc/confluent/docker/run
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+    networks: [yape-local]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    container_name: yape-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+    ports:
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    networks: [yape-local]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: yape-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    # Only the UI is published. The collector reaches jaeger:4317 over the
+    # shared network, so exposing Jaeger's own OTLP ports would just collide
+    # with otel-collector on the host.
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+    networks: [yape-local]
+
+volumes:
+  postgres18_data:
+  redisinsight_data:
+  redis_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+
+networks:
+  yape-local:
+    # Fixed name so each repo can join it with `external: true`.
+    name: yape-local
